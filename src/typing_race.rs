@@ -51,6 +51,10 @@ impl RaceScreen {
         self.all_finished = all_finished;
     }
 
+    pub fn is_over(&self) -> bool {
+        self.all_finished
+    }
+
     fn counting_down(&self) -> bool {
         self.countdown_ends_at.is_some_and(|deadline| Instant::now() < deadline)
     }
@@ -78,15 +82,15 @@ impl RaceScreen {
         Some(ClientProgress { finished, detail: GameProgress::TypingRace { correct_chars: self.typed, elapsed_ms } })
     }
 
-    pub fn render(&self, frame: &mut Frame, area: Rect) {
+    pub fn render(&self, frame: &mut Frame, area: Rect, is_host: bool) {
         if self.all_finished {
-            self.render_results(frame, area);
+            self.render_results(frame, area, is_host);
         } else {
-            self.render_racing(frame, area);
+            self.render_racing(frame, area, is_host);
         }
     }
 
-    fn render_racing(&self, frame: &mut Frame, area: Rect) {
+    fn render_racing(&self, frame: &mut Frame, area: Rect, is_host: bool) {
         let [sentence_area, gauge_area, racers_area, hint_area] = Layout::vertical([
             Constraint::Length(3),
             Constraint::Length(1),
@@ -110,13 +114,15 @@ impl RaceScreen {
         let items: Vec<ListItem> = self.sorted_racers().into_iter().map(|r| racer_line(r, total)).collect();
         frame.render_widget(List::new(items).block(Block::bordered().title("Racers")), racers_area);
 
-        frame.render_widget(Paragraph::new("ESC to quit"), hint_area);
+        let hint = if is_host { "ENTER to end race early, ESC to quit" } else { "ESC to quit" };
+        frame.render_widget(Paragraph::new(hint), hint_area);
     }
 
-    fn render_results(&self, frame: &mut Frame, area: Rect) {
+    fn render_results(&self, frame: &mut Frame, area: Rect, is_host: bool) {
         let [title_area, results_area] = Layout::vertical([Constraint::Length(1), Constraint::Min(3)]).areas(area);
 
-        frame.render_widget(Paragraph::new("Race over! (ESC to quit)"), title_area);
+        let title = if is_host { "Race over! (R to play again, ESC to quit)" } else { "Race over! (waiting for host... ESC to quit)" };
+        frame.render_widget(Paragraph::new(title), title_area);
 
         // Already sorted by finish place, which - since everyone races the
         // same sentence from the same start signal - is equivalent to

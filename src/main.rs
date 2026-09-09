@@ -107,6 +107,13 @@ async fn join_server(
     Ok((out_tx, in_rx))
 }
 
+/// Host-only actions that need the server's authoritative state (the
+/// `GameHub`), sent through `App::host_tx` to the task that owns it.
+enum HostCommand {
+    Start(GameConfig),
+    EndRace,
+}
+
 enum Screen {
     /// Host only: picking the game type before the lobby opens.
     Setup { menu: setup::GameKindMenu },
@@ -121,8 +128,9 @@ struct App {
     is_host: bool,
     code: String,
     users: Vec<String>,
-    /// Only present for the host: sends a `GameConfig` here to start it.
-    start_tx: Option<mpsc::UnboundedSender<GameConfig>>,
+    /// Only present for the host: sends commands here that only the host
+    /// may issue (starting or ending a game).
+    host_tx: Option<mpsc::UnboundedSender<HostCommand>>,
     net_tx: mpsc::UnboundedSender<ClientMessage>,
     net_rx: mpsc::UnboundedReceiver<ServerMessage>,
     screen: Screen,
@@ -133,7 +141,7 @@ impl App {
         is_host: bool,
         code: String,
         auto_start: bool,
-        start_tx: Option<mpsc::UnboundedSender<GameConfig>>,
+        host_tx: Option<mpsc::UnboundedSender<HostCommand>>,
         net_tx: mpsc::UnboundedSender<ClientMessage>,
         net_rx: mpsc::UnboundedReceiver<ServerMessage>,
     ) -> Self {
@@ -148,15 +156,15 @@ impl App {
         } else {
             Screen::JoinConfirm { kind: setup::GameKind::SingleGame }
         };
-        let app = Self { should_quit: false, is_host, code, users: Vec::new(), start_tx, net_tx, net_rx, screen };
+        let app = Self { should_quit: false, is_host, code, users: Vec::new(), host_tx, net_tx, net_rx, screen };
 
         // Solo mode: nobody to wait for, so skip straight past game
         // selection and the lobby - accept immediately and kick the race
         // off as soon as the server round-trips back.
         if auto_start {
             let _ = app.net_tx.send(ClientMessage::Accept);
-            if let Some(tx) = &app.start_tx {
-                let _ = tx.send(setup::GameKind::SingleGame.config());
+            if let Some(tx) = &app.host_tx {
+                let _ = tx.send(HostCommand::Start(setup::GameKind::SingleGame.config()));
             }
         }
 
@@ -237,14 +245,24 @@ impl App {
             Screen::Lobby { kind } => match code {
                 KeyCode::Char('q') => self.should_quit = true,
                 KeyCode::Enter => {
-                    if let Some(tx) = &self.start_tx {
-                        let _ = tx.send(kind.config());
+                    if let Some(tx) = &self.host_tx {
+                        let _ = tx.send(HostCommand::Start(kind.config()));
                     }
                 }
                 _ => {}
             },
             Screen::Race(race) => match code {
                 KeyCode::Esc => self.should_quit = true,
+                KeyCode::Enter if self.is_host && !race.is_over() => {
+                    if let Some(tx) = &self.host_tx {
+                        let _ = tx.send(HostCommand::EndRace);
+                    }
+                }
+                KeyCode::Char('r') if self.is_host && race.is_over() => {
+                    if let Some(tx) = &self.host_tx {
+                        let _ = tx.send(HostCommand::Start(setup::GameKind::SingleGame.config()));
+                    }
+                }
                 KeyCode::Char(c) => {
                     if let Some(progress) = race.handle_char(c) {
                         let _ = self.net_tx.send(ClientMessage::Progress(progress));
@@ -257,10 +275,10 @@ impl App {
 }
 
 /// Binds the listener and discovery responder and starts the task that
-/// turns `start_tx` sends into actual `GameConfig` broadcasts. Shared by
+/// turns `HostCommand`s into actual server-side effects. Shared by
 /// `--host` and the no-args solo mode, which are identical except for
 /// whether the player has to pick a game type and wait in the lobby.
-fn start_hosting(code: String) -> mpsc::UnboundedSender<GameConfig> {
+fn start_hosting(code: String) -> mpsc::UnboundedSender<HostCommand> {
     let clients: waiting::Clients = Arc::new(Mutex::new(HashMap::new()));
     let hub = game_hub::GameHub::new();
     // The roster (sent as a ServerMessage and rendered in the TUI) already
@@ -268,20 +286,24 @@ fn start_hosting(code: String) -> mpsc::UnboundedSender<GameConfig> {
     // dropped here. Printing it would corrupt the TUI's alternate screen,
     // so don't route it to stdout/stderr.
     let (events_tx, _events_rx) = tokio::sync::mpsc::unbounded_channel();
-    // Flips to true once the game starts, so the listener and discovery
-    // responder stop taking on new (and now-unhelpable) latecomers.
+    // Flips to true once the first game starts, so the listener and
+    // discovery responder stop taking on new (and now-unhelpable)
+    // latecomers - including across a later "play again".
     let (stop_tx, stop_rx) = tokio::sync::watch::channel(false);
 
     tokio::spawn(waiting::listen(code.clone(), clients.clone(), hub.clone(), events_tx, stop_rx.clone()));
     tokio::spawn(waiting::respond_to_discovery(code, stop_rx));
 
-    let (start_tx, mut start_rx) = mpsc::unbounded_channel::<GameConfig>();
+    let (host_tx, mut host_rx) = mpsc::unbounded_channel::<HostCommand>();
     tokio::spawn(async move {
-        while let Some(config) = start_rx.recv().await {
-            waiting::start_game(&clients, &hub, config, &stop_tx).await;
+        while let Some(cmd) = host_rx.recv().await {
+            match cmd {
+                HostCommand::Start(config) => waiting::start_game(&clients, &hub, config, &stop_tx).await,
+                HostCommand::EndRace => waiting::force_end_race(&clients, &hub).await,
+            }
         }
     });
-    start_tx
+    host_tx
 }
 
 #[tokio::main]
@@ -290,18 +312,18 @@ async fn main() -> Result<()> {
     let mode = parse_mode()?;
     let username = detect_username();
 
-    let (is_host, code, host_ip, start_tx, auto_start) = match mode {
+    let (is_host, code, host_ip, host_tx, auto_start) = match mode {
         Mode::Solo => {
             let code = waiting::generate_code();
-            let start_tx = start_hosting(code.clone());
+            let host_tx = start_hosting(code.clone());
             println!("starting a solo game...");
-            (true, code, "127.0.0.1".to_string(), Some(start_tx), true)
+            (true, code, "127.0.0.1".to_string(), Some(host_tx), true)
         }
         Mode::Host => {
             let code = waiting::generate_code();
-            let start_tx = start_hosting(code.clone());
+            let host_tx = start_hosting(code.clone());
             println!("hosting — join code: {code}");
-            (true, code, "127.0.0.1".to_string(), Some(start_tx), false)
+            (true, code, "127.0.0.1".to_string(), Some(host_tx), false)
         }
         Mode::Connect { code } => {
             println!("looking for host with code {code}...");
@@ -313,7 +335,7 @@ async fn main() -> Result<()> {
     let (net_tx, net_rx) = join_server(&host_ip, code.clone(), username).await?;
 
     tokio::task::spawn_blocking(move || {
-        ratatui::run(|terminal| run(terminal, is_host, code, auto_start, start_tx, net_tx, net_rx)).context("failed to run app")
+        ratatui::run(|terminal| run(terminal, is_host, code, auto_start, host_tx, net_tx, net_rx)).context("failed to run app")
     })
     .await
     .context("tui task panicked")?
@@ -324,11 +346,11 @@ fn run(
     is_host: bool,
     code: String,
     auto_start: bool,
-    start_tx: Option<mpsc::UnboundedSender<GameConfig>>,
+    host_tx: Option<mpsc::UnboundedSender<HostCommand>>,
     net_tx: mpsc::UnboundedSender<ClientMessage>,
     net_rx: mpsc::UnboundedReceiver<ServerMessage>,
 ) -> Result<()> {
-    let mut app = App::new(is_host, code, auto_start, start_tx, net_tx, net_rx);
+    let mut app = App::new(is_host, code, auto_start, host_tx, net_tx, net_rx);
     while !app.should_quit {
         terminal.draw(|frame| render(frame, &app))?;
         app.update()?;
@@ -341,7 +363,7 @@ fn render(frame: &mut Frame, app: &App) {
         Screen::Setup { menu } => menu.render(frame, frame.area()),
         Screen::JoinConfirm { kind } => setup::render_join_confirm(frame, frame.area(), *kind),
         Screen::Lobby { .. } => render_lobby(frame, app),
-        Screen::Race(race) => race.render(frame, frame.area()),
+        Screen::Race(race) => race.render(frame, frame.area(), app.is_host),
     }
 }
 

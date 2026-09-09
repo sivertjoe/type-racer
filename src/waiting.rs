@@ -78,8 +78,12 @@ pub async fn listen(
 
                 tokio::spawn(handle_connection(id, addr, stream, code.clone(), clients.clone(), hub.clone(), events.clone()));
             }
-            _ = stop.changed() => {
-                if *stop.borrow() {
+            result = stop.changed() => {
+                // An error means the sender was dropped (e.g. the app is
+                // shutting down) without ever sending `true` - treat that
+                // as "stop" too, or this spins forever re-polling an
+                // already-closed channel.
+                if result.is_err() || *stop.borrow() {
                     return Ok(());
                 }
             }
@@ -110,6 +114,14 @@ pub async fn start_game(clients: &Clients, hub: &SharedGameHub, config: GameConf
     });
 }
 
+/// Host-triggered early end to the current race: reports whatever
+/// progress racers had made as final. A no-op if no race is in progress.
+pub async fn force_end_race(clients: &Clients, hub: &SharedGameHub) {
+    if let HubEffect::Broadcast(msg) = hub.lock().await.force_end() {
+        broadcast(&*clients.lock().await, msg);
+    }
+}
+
 /// Listens for UDP discovery broadcasts and replies to any that carry a
 /// matching `code`, until `stop` is set to `true`.
 pub async fn respond_to_discovery(code: String, mut stop: watch::Receiver<bool>) -> Result<()> {
@@ -131,8 +143,8 @@ pub async fn respond_to_discovery(code: String, mut stop: watch::Receiver<bool>)
                     let _ = socket.send_to(&json, addr).await;
                 }
             }
-            _ = stop.changed() => {
-                if *stop.borrow() {
+            result = stop.changed() => {
+                if result.is_err() || *stop.borrow() {
                     return Ok(());
                 }
             }
@@ -201,12 +213,14 @@ async fn handle_connection(
     };
 
     let (outbox_tx, mut outbox_rx) = mpsc::unbounded_channel::<ServerMessage>();
-    {
+    let username = {
         let mut guard = clients.lock().await;
+        let username = dedupe_username(&guard, username);
         guard.insert(id, ClientHandle { id, addr, username: username.clone(), accepted: false, outbox: outbox_tx });
         // Not broadcast yet: this client isn't accepted, so the roster
         // hasn't actually changed for anyone.
-    }
+        username
+    };
     let _ = events.send(LobbyEvent::ClientJoined { id, addr, username: username.clone() });
 
     if let Ok(json) = serde_json::to_string(&ServerMessage::Welcome) {
@@ -261,6 +275,16 @@ async fn handle_connection(
         broadcast_roster(&guard);
     }
     let _ = events.send(LobbyEvent::ClientLeft { id, addr });
+}
+
+/// If `username` is already taken by another connected client, appends
+/// " (1)", " (2)", etc. until it's unique.
+fn dedupe_username(clients: &HashMap<u32, ClientHandle>, username: String) -> String {
+    let taken: HashSet<&str> = clients.values().map(|c| c.username.as_str()).collect();
+    if !taken.contains(username.as_str()) {
+        return username;
+    }
+    (1..).map(|n| format!("{username} ({n})")).find(|candidate| !taken.contains(candidate.as_str())).unwrap()
 }
 
 /// Sends every client the current list of *accepted* usernames (clients

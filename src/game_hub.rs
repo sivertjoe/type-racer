@@ -33,8 +33,14 @@ impl GameHub {
         Arc::new(Mutex::new(Self { state: State::Idle }))
     }
 
-    /// Begins the ready handshake for a new game.
+    /// Begins the ready handshake for a new game. A no-op unless nothing
+    /// else is currently starting or in progress - guards against e.g. a
+    /// double Enter-press in the lobby restarting an already-starting
+    /// race out from under everyone.
     pub fn start(&mut self, config: GameConfig) -> HubEffect {
+        if !matches!(self.state, State::Idle) {
+            return HubEffect::None;
+        }
         self.state = State::Starting { ready: HashSet::new() };
         HubEffect::Broadcast(ServerMessage::GameStarting { config })
     }
@@ -66,7 +72,8 @@ impl GameHub {
     /// Records `id`'s latest progress and returns the updated roster to
     /// broadcast. Assigns a finish place the first time a client reports
     /// `finished`. `all_finished` in the broadcast reflects whether every
-    /// id in `connected` has now finished.
+    /// id in `connected` has now finished; once true, the hub goes back to
+    /// `Idle` so a new game (a "play again") can be started.
     pub fn client_progress(&mut self, id: u32, username: String, progress: ClientProgress, connected: &HashSet<u32>) -> HubEffect {
         let State::Racing { racers, next_place } = &mut self.state else {
             return HubEffect::None;
@@ -83,7 +90,24 @@ impl GameHub {
         racers.insert(id, RacerProgress { username, finished: progress.finished, place, detail: progress.detail });
 
         let all_finished = connected.iter().all(|id| racers.get(id).is_some_and(|r| r.finished));
+        let racers: Vec<RacerProgress> = racers.values().cloned().collect();
 
-        HubEffect::Broadcast(ServerMessage::RaceState { racers: racers.values().cloned().collect(), all_finished })
+        if all_finished {
+            self.state = State::Idle;
+        }
+
+        HubEffect::Broadcast(ServerMessage::RaceState { racers, all_finished })
+    }
+
+    /// Ends the race early (host-triggered), reporting whatever progress
+    /// racers had made as final and returning the hub to `Idle`. A no-op
+    /// unless a race is actually in progress.
+    pub fn force_end(&mut self) -> HubEffect {
+        let State::Racing { racers, .. } = &self.state else {
+            return HubEffect::None;
+        };
+        let racers: Vec<RacerProgress> = racers.values().cloned().collect();
+        self.state = State::Idle;
+        HubEffect::Broadcast(ServerMessage::RaceState { racers, all_finished: true })
     }
 }

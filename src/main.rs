@@ -2,6 +2,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 
+use clap::{Parser, Subcommand};
 use color_eyre::Result;
 use color_eyre::eyre::{Context, eyre};
 use crossterm::event::{self, KeyCode};
@@ -23,6 +24,37 @@ mod words;
 
 use protocol::{ClientMessage, GameConfig, Pacing, RoundOverInfo, ServerMessage};
 
+#[derive(Parser)]
+#[command(name = "type-racer", about = "A terminal-based multiplayer typing race game", version)]
+struct Cli {
+    #[command(subcommand)]
+    command: Option<Command>,
+}
+
+#[derive(Subcommand)]
+enum Command {
+    /// Host a game for others to join
+    Host {
+        /// Use a specific join code instead of a randomly generated one
+        #[arg(long, value_name = "CODE", value_parser = non_empty)]
+        code: Option<String>,
+    },
+    /// Connect to a hosted game
+    Connect {
+        /// The host's join code
+        #[arg(value_parser = non_empty)]
+        code: String,
+        /// Connect directly to this address instead of LAN discovery
+        /// (needed for internet play, once the host has port-forwarded)
+        #[arg(long, value_name = "ADDRESS", value_parser = non_empty)]
+        ip: Option<String>,
+    },
+}
+
+fn non_empty(s: &str) -> Result<String, String> {
+    if s.is_empty() { Err("must not be empty".to_string()) } else { Ok(s.to_string()) }
+}
+
 enum Mode {
     /// No arguments: just play by yourself, skipping straight past game
     /// selection and the lobby wait.
@@ -30,22 +62,17 @@ enum Mode {
     /// `code` is `Some` when `--code` picked a specific one; otherwise a
     /// random one is generated.
     Host { code: Option<String> },
-    Connect { code: String },
+    /// `ip` is `Some` when `--ip` gave a specific address to connect to
+    /// directly (e.g. over the internet, once the host has port-forwarded);
+    /// otherwise the host is found via LAN broadcast discovery.
+    Connect { code: String, ip: Option<String> },
 }
 
-fn parse_mode() -> Result<Mode> {
-    let args: Vec<String> = std::env::args().skip(1).collect();
-    match args.as_slice() {
-        [] => Ok(Mode::Solo),
-        [flag] if flag == "--host" => Ok(Mode::Host { code: None }),
-        [flag, opt, code] if flag == "--host" && opt == "--code" => {
-            if code.is_empty() {
-                return Err(eyre!("--code needs a non-empty value"));
-            }
-            Ok(Mode::Host { code: Some(code.to_uppercase()) })
-        }
-        [flag, code] if flag == "--connect" => Ok(Mode::Connect { code: code.clone() }),
-        _ => Err(eyre!("usage: type-racer [--host [--code <code>] | --connect <code>]")),
+fn parse_mode() -> Mode {
+    match Cli::parse().command {
+        None => Mode::Solo,
+        Some(Command::Host { code }) => Mode::Host { code: code.map(|c| c.to_uppercase()) },
+        Some(Command::Connect { code, ip }) => Mode::Connect { code, ip },
     }
 }
 
@@ -393,7 +420,7 @@ fn start_hosting(code: String) -> mpsc::UnboundedSender<HostCommand> {
 #[tokio::main]
 async fn main() -> Result<()> {
     color_eyre::install()?;
-    let mode = parse_mode()?;
+    let mode = parse_mode();
     let username = detect_username();
 
     let (is_host, code, host_ip, host_tx, auto_start) = match mode {
@@ -407,9 +434,19 @@ async fn main() -> Result<()> {
             let code = code.unwrap_or_else(waiting::generate_code);
             let host_tx = start_hosting(code.clone());
             println!("hosting — join code: {code}");
+            println!(
+                "on the same network: players just need the code. \
+                 over the internet: forward TCP port {} to this machine, then have them run \
+                 --connect {code} --ip <your public IP>",
+                waiting::PORT
+            );
             (true, code, "127.0.0.1".to_string(), Some(host_tx), false)
         }
-        Mode::Connect { code } => {
+        Mode::Connect { code, ip: Some(ip) } => {
+            println!("connecting to {ip} with code {code}...");
+            (false, code, ip, None, false)
+        }
+        Mode::Connect { code, ip: None } => {
             println!("looking for host with code {code}...");
             let addr = waiting::find_host(&code).await?;
             (false, code, addr.ip().to_string(), None, false)

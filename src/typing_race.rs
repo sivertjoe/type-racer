@@ -30,10 +30,21 @@ pub struct RaceScreen {
     racers: Vec<RacerProgress>,
     /// True once the server says every connected racer has finished.
     all_finished: bool,
+    /// True for a knockout round this client isn't competing in - they
+    /// can watch, but keystrokes do nothing.
+    spectating: bool,
 }
 
 impl RaceScreen {
     pub fn new(sentence: String) -> Self {
+        Self::build(sentence, false)
+    }
+
+    pub fn new_spectating(sentence: String) -> Self {
+        Self::build(sentence, true)
+    }
+
+    fn build(sentence: String, spectating: bool) -> Self {
         Self {
             sentence: sentence.chars().collect(),
             typed: 0,
@@ -41,6 +52,7 @@ impl RaceScreen {
             finished_sent: false,
             racers: Vec::new(),
             all_finished: false,
+            spectating,
         }
     }
 
@@ -71,7 +83,7 @@ impl RaceScreen {
     /// advances progress - anything else is silently ignored. Returns the
     /// progress to report to the server, if this keystroke changed it.
     pub fn handle_char(&mut self, c: char) -> Option<ClientProgress> {
-        if self.finished_sent || !self.accepting_input() {
+        if self.spectating || self.finished_sent || !self.accepting_input() {
             return None;
         }
         if self.sentence.get(self.typed) != Some(&c) {
@@ -107,12 +119,19 @@ impl RaceScreen {
             let remaining = self.countdown_ends_at.unwrap().saturating_duration_since(Instant::now()).as_secs() + 1;
             let text = Paragraph::new(format!("starting in {remaining}..."));
             frame.render_widget(text, sentence_area);
+        } else if self.spectating {
+            let text: String = self.sentence.iter().collect();
+            frame.render_widget(Paragraph::new(text).block(Block::bordered().title("Watching")), sentence_area);
         } else {
             frame.render_widget(Paragraph::new(self.sentence_line()).block(Block::bordered().title("Type this")), sentence_area);
         }
 
-        let pct = (self.typed as f64 / self.sentence.len().max(1) as f64 * 100.0) as u16;
-        frame.render_widget(Gauge::default().percent(pct).label(format!("{pct}%")), gauge_area);
+        if self.spectating {
+            frame.render_widget(Paragraph::new("you're spectating this round"), gauge_area);
+        } else {
+            let pct = (self.typed as f64 / self.sentence.len().max(1) as f64 * 100.0) as u16;
+            frame.render_widget(Gauge::default().percent(pct).label(format!("{pct}%")), gauge_area);
+        }
 
         let total = self.sentence.len();
         let items: Vec<ListItem> = self.sorted_racers().into_iter().map(|r| racer_line(r, total)).collect();

@@ -1,5 +1,7 @@
 use std::collections::{HashMap, HashSet};
+use std::future::Future;
 use std::net::SocketAddr;
+use std::pin::Pin;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -9,12 +11,16 @@ use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{TcpListener, TcpStream, UdpSocket};
 use tokio::sync::{Mutex, mpsc, watch};
 
-use crate::game_hub::{HubEffect, SharedGameHub};
-use crate::protocol::{ClientMessage, DiscoveryRequest, DiscoveryResponse, GameConfig, ServerMessage};
+use crate::game_hub::{HubEffect, SharedActiveGame};
+use crate::protocol::{ClientMessage, DiscoveryRequest, DiscoveryResponse, GameConfig, Pacing, ServerMessage};
 
 /// How long the server waits for every client to confirm `ReadyForGame`
 /// before starting the race anyway (in case one is stuck or has dropped).
 const READY_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// How long an auto-paced knockout waits after a round ends before
+/// starting the next one.
+const AUTO_ADVANCE_DELAY: Duration = Duration::from_secs(4);
 
 /// Port the server listens on for game connections.
 pub const PORT: u16 = 7878;
@@ -59,9 +65,10 @@ pub fn generate_code() -> String {
 pub async fn listen(
     code: String,
     clients: Clients,
-    hub: SharedGameHub,
+    hub: SharedActiveGame,
     events: mpsc::UnboundedSender<LobbyEvent>,
     mut stop: watch::Receiver<bool>,
+    chosen_game: watch::Sender<Option<String>>,
 ) -> Result<()> {
     let listener = TcpListener::bind(("0.0.0.0", PORT))
         .await
@@ -76,7 +83,7 @@ pub async fn listen(
                 let id = next_id;
                 next_id += 1;
 
-                tokio::spawn(handle_connection(id, addr, stream, code.clone(), clients.clone(), hub.clone(), events.clone()));
+                tokio::spawn(handle_connection(id, addr, stream, code.clone(), clients.clone(), hub.clone(), events.clone(), chosen_game.clone()));
             }
             result = stop.changed() => {
                 // An error means the sender was dropped (e.g. the app is
@@ -91,40 +98,92 @@ pub async fn listen(
     }
 }
 
-/// Starts a new game: stops accepting new connections and discovery
-/// requests (a client joining mid-race would never get `GameStarting`,
-/// yet would still count toward the "has everyone finished" check
-/// forever), broadcasts `GameStarting`, and once every connected client
-/// has confirmed ready (or [`READY_TIMEOUT`] elapses), broadcasts
-/// `GameBegin`.
-pub async fn start_game(clients: &Clients, hub: &SharedGameHub, config: GameConfig, stop_listening: &watch::Sender<bool>) {
+/// Starts a new game (Single Game or a Knockout tournament): stops
+/// accepting new connections and discovery requests (a client joining
+/// mid-race would never get `GameStarting`, yet would still count toward
+/// the "has everyone finished" check forever), then hands `config` to the
+/// hub and applies whatever it produces.
+pub async fn start_game(clients: &Clients, hub: &SharedActiveGame, config: GameConfig, stop_listening: &watch::Sender<bool>) {
     let _ = stop_listening.send(true);
 
-    if let HubEffect::Broadcast(msg) = hub.lock().await.start(config) {
-        broadcast(&*clients.lock().await, msg);
-    }
+    let participants = accepted_participants(clients).await;
+    let effect = hub.lock().await.start(config, participants);
+    apply_effect(clients, hub, effect).await;
+    schedule_ready_timeout(clients.clone(), hub.clone());
+}
 
-    let clients = clients.clone();
-    let hub = hub.clone();
+/// Host-triggered early end to the current round: reports whatever
+/// progress racers had made as final. A no-op if no round is in progress.
+pub async fn force_end_race(clients: &Clients, hub: &SharedActiveGame) {
+    let effect = hub.lock().await.force_end();
+    apply_effect(clients, hub, effect).await;
+}
+
+/// Host-triggered (or auto-paced) advance to the next knockout round. A
+/// no-op unless a knockout tournament is actually between rounds.
+///
+/// Boxed because auto-pacing makes this mutually recursive with
+/// [`apply_effect`] (each round-over can schedule the next round's
+/// auto-advance, which calls back in here) - the compiler can't size an
+/// `async fn` cycle like that without an indirection to break it.
+pub fn continue_knockout_round<'a>(clients: &'a Clients, hub: &'a SharedActiveGame) -> Pin<Box<dyn Future<Output = ()> + Send + 'a>> {
+    Box::pin(async move {
+        let effect = hub.lock().await.continue_knockout_round();
+        apply_effect(clients, hub, effect).await;
+        schedule_ready_timeout(clients.clone(), hub.clone());
+    })
+}
+
+/// The set of client ids currently accepted (past their join-confirmation
+/// screen), with their usernames - what "everyone playing" means for
+/// starting a game or gating a round.
+async fn accepted_participants(clients: &Clients) -> HashMap<u32, String> {
+    clients.lock().await.values().filter(|c| c.accepted).map(|c| (c.id, c.username.clone())).collect()
+}
+
+/// Applies a `HubEffect`: broadcasts or targets messages as needed, and -
+/// if a knockout round just ended in auto-pacing - schedules the next
+/// round to start on its own after [`AUTO_ADVANCE_DELAY`].
+async fn apply_effect(clients: &Clients, hub: &SharedActiveGame, effect: HubEffect) {
+    match effect {
+        HubEffect::None => {}
+        HubEffect::Broadcast(msg) => {
+            let auto_advance = matches!(&msg, ServerMessage::RoundOver(info) if info.pacing == Pacing::Auto);
+            broadcast(&*clients.lock().await, msg);
+            if auto_advance {
+                let clients = clients.clone();
+                let hub = hub.clone();
+                tokio::spawn(async move {
+                    tokio::time::sleep(AUTO_ADVANCE_DELAY).await;
+                    continue_knockout_round(&clients, &hub).await;
+                });
+            }
+        }
+        HubEffect::Targeted(per_client) => {
+            let guard = clients.lock().await;
+            for (id, msg) in per_client {
+                if let Some(client) = guard.get(&id) {
+                    let _ = client.outbox.send(msg);
+                }
+            }
+        }
+    }
+}
+
+fn schedule_ready_timeout(clients: Clients, hub: SharedActiveGame) {
     tokio::spawn(async move {
         tokio::time::sleep(READY_TIMEOUT).await;
-        if let HubEffect::Broadcast(msg) = hub.lock().await.force_begin() {
-            broadcast(&*clients.lock().await, msg);
-        }
+        let effect = hub.lock().await.force_begin();
+        apply_effect(&clients, &hub, effect).await;
     });
 }
 
-/// Host-triggered early end to the current race: reports whatever
-/// progress racers had made as final. A no-op if no race is in progress.
-pub async fn force_end_race(clients: &Clients, hub: &SharedGameHub) {
-    if let HubEffect::Broadcast(msg) = hub.lock().await.force_end() {
-        broadcast(&*clients.lock().await, msg);
-    }
-}
-
 /// Listens for UDP discovery broadcasts and replies to any that carry a
-/// matching `code`, until `stop` is set to `true`.
-pub async fn respond_to_discovery(code: String, mut stop: watch::Receiver<bool>) -> Result<()> {
+/// matching `code`, until `stop` is set to `true`. Stays silent until
+/// `chosen_game` is `Some` (the host has picked a game in Setup) - clients
+/// shouldn't be able to find, and so join, a lobby the host hasn't
+/// actually opened yet.
+pub async fn respond_to_discovery(code: String, mut stop: watch::Receiver<bool>, chosen_game: watch::Receiver<Option<String>>) -> Result<()> {
     let socket = UdpSocket::bind(("0.0.0.0", DISCOVERY_PORT))
         .await
         .context("failed to bind discovery socket")?;
@@ -137,7 +196,8 @@ pub async fn respond_to_discovery(code: String, mut stop: watch::Receiver<bool>)
                 let Ok(request) = serde_json::from_slice::<DiscoveryRequest>(&buf[..len]) else {
                     continue;
                 };
-                if request.code.eq_ignore_ascii_case(&code)
+                if chosen_game.borrow().is_some()
+                    && request.code.eq_ignore_ascii_case(&code)
                     && let Ok(json) = serde_json::to_vec(&DiscoveryResponse { code: code.clone() })
                 {
                     let _ = socket.send_to(&json, addr).await;
@@ -190,8 +250,9 @@ async fn handle_connection(
     stream: TcpStream,
     expected_code: String,
     clients: Clients,
-    hub: SharedGameHub,
+    hub: SharedActiveGame,
     events: mpsc::UnboundedSender<LobbyEvent>,
+    chosen_game: watch::Sender<Option<String>>,
 ) {
     let (read_half, mut write_half) = stream.into_split();
     let mut lines = BufReader::new(read_half).lines();
@@ -212,6 +273,20 @@ async fn handle_connection(
         return;
     };
 
+    // The discovery gate is the primary way this is avoided (a client
+    // can't even find the host yet), but enforce it here too in case
+    // someone connects with an address they already had cached. The
+    // host's own (loopback) connection is exempt - it connects before
+    // picking anything.
+    let game_label = chosen_game.borrow().clone();
+    if !addr.ip().is_loopback() && game_label.is_none() {
+        let reject = ServerMessage::Rejected { reason: "the host hasn't chosen a game yet - try again in a moment".into() };
+        if let Ok(json) = serde_json::to_string(&reject) {
+            let _ = write_half.write_all(format!("{json}\n").as_bytes()).await;
+        }
+        return;
+    }
+
     let (outbox_tx, mut outbox_rx) = mpsc::unbounded_channel::<ServerMessage>();
     let username = {
         let mut guard = clients.lock().await;
@@ -223,7 +298,7 @@ async fn handle_connection(
     };
     let _ = events.send(LobbyEvent::ClientJoined { id, addr, username: username.clone() });
 
-    if let Ok(json) = serde_json::to_string(&ServerMessage::Welcome) {
+    if let Ok(json) = serde_json::to_string(&ServerMessage::Welcome { game_label }) {
         let _ = write_half.write_all(format!("{json}\n").as_bytes()).await;
     }
 
@@ -242,6 +317,12 @@ async fn handle_connection(
                         let Ok(msg) = serde_json::from_str::<ClientMessage>(&line) else { continue };
                         let effect = match msg {
                             ClientMessage::Join { .. } => continue, // already joined
+                            ClientMessage::HostChoseGame { label } => {
+                                if addr.ip().is_loopback() {
+                                    let _ = chosen_game.send(Some(label));
+                                }
+                                continue;
+                            }
                             ClientMessage::Accept => {
                                 let mut guard = clients.lock().await;
                                 if let Some(client) = guard.get_mut(&id) {
@@ -251,17 +332,15 @@ async fn handle_connection(
                                 continue;
                             }
                             ClientMessage::ReadyForGame => {
-                                let connected: HashSet<u32> = clients.lock().await.keys().copied().collect();
-                                hub.lock().await.client_ready(id, &connected)
+                                let participants: HashSet<u32> = accepted_participants(&clients).await.into_keys().collect();
+                                hub.lock().await.client_ready(id, &participants)
                             }
                             ClientMessage::Progress(progress) => {
-                                let connected: HashSet<u32> = clients.lock().await.keys().copied().collect();
-                                hub.lock().await.client_progress(id, username.clone(), progress, &connected)
+                                let participants: HashSet<u32> = accepted_participants(&clients).await.into_keys().collect();
+                                hub.lock().await.client_progress(id, username.clone(), progress, &participants)
                             }
                         };
-                        if let HubEffect::Broadcast(msg) = effect {
-                            broadcast(&*clients.lock().await, msg);
-                        }
+                        apply_effect(&clients, &hub, effect).await;
                     }
                     _ => break,
                 }

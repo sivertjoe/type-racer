@@ -13,13 +13,14 @@ use tokio::net::TcpStream;
 use tokio::sync::{Mutex, mpsc};
 
 mod game_hub;
+mod knockout;
 mod protocol;
 mod setup;
 mod typing_race;
 mod waiting;
 mod words;
 
-use protocol::{ClientMessage, GameConfig, ServerMessage};
+use protocol::{ClientMessage, GameConfig, Pacing, RoundOverInfo, ServerMessage};
 
 enum Mode {
     /// No arguments: just play by yourself, skipping straight past game
@@ -56,7 +57,7 @@ async fn join_server(
     ip: &str,
     code: String,
     username: String,
-) -> Result<(mpsc::UnboundedSender<ClientMessage>, mpsc::UnboundedReceiver<ServerMessage>)> {
+) -> Result<(Option<String>, mpsc::UnboundedSender<ClientMessage>, mpsc::UnboundedReceiver<ServerMessage>)> {
     let stream = TcpStream::connect((ip, waiting::PORT))
         .await
         .context("failed to connect to server")?;
@@ -69,15 +70,15 @@ async fn join_server(
         .context("failed to send join message")?;
 
     let mut lines = BufReader::new(read_half).lines();
-    match lines.next_line().await.context("failed to read server reply")? {
+    let game_label = match lines.next_line().await.context("failed to read server reply")? {
         Some(line) => match serde_json::from_str::<ServerMessage>(&line) {
-            Ok(ServerMessage::Welcome) => {}
+            Ok(ServerMessage::Welcome { game_label }) => game_label,
             Ok(ServerMessage::Rejected { reason }) => return Err(eyre!("server rejected join: {reason}")),
             Ok(other) => return Err(eyre!("unexpected first reply from server: {other:?}")),
             Err(err) => return Err(eyre!("unexpected reply from server: {err}")),
         },
         None => return Err(eyre!("server closed the connection during join")),
-    }
+    };
 
     let (out_tx, mut out_rx) = mpsc::unbounded_channel::<ClientMessage>();
     tokio::spawn(async move {
@@ -105,23 +106,33 @@ async fn join_server(
         }
     });
 
-    Ok((out_tx, in_rx))
+    Ok((game_label, out_tx, in_rx))
 }
 
-/// Host-only actions that need the server's authoritative state (the
-/// `GameHub`), sent through `App::host_tx` to the task that owns it.
+/// Host-only actions that need the server's authoritative state, sent
+/// through `App::host_tx` to the task that owns it.
 enum HostCommand {
     Start(GameConfig),
     EndRace,
+    /// Advance a knockout tournament to its next round.
+    ContinueRound,
 }
 
 enum Screen {
     /// Host only: picking the game type before the lobby opens.
     Setup { menu: setup::GameKindMenu },
-    /// Client only: confirming the game type the host picked.
-    JoinConfirm { kind: setup::GameKind },
+    /// Client only: waiting to confirm once the host has picked a game.
+    /// `label` is always present in practice - a client can only reach
+    /// this screen after the host has already announced its choice.
+    JoinConfirm { label: String },
     Lobby { kind: setup::GameKind },
+    /// Used both for Single Game's one race and for each round of a
+    /// knockout tournament (racing or spectating).
     Race(typing_race::RaceScreen),
+    /// A knockout round (or best-of-3 finals game) just ended.
+    KnockoutRoundOver(RoundOverInfo),
+    /// The knockout tournament is fully decided.
+    KnockoutOver { standings: Vec<String> },
 }
 
 struct App {
@@ -129,8 +140,12 @@ struct App {
     is_host: bool,
     code: String,
     users: Vec<String>,
+    /// The kind last used to start a game - remembered so "play again"
+    /// (both Single Game's and a knockout tournament's) replays the same
+    /// kind without the host having to revisit Setup.
+    last_kind: setup::GameKind,
     /// Only present for the host: sends commands here that only the host
-    /// may issue (starting or ending a game).
+    /// may issue (starting, ending, or advancing a game).
     host_tx: Option<mpsc::UnboundedSender<HostCommand>>,
     net_tx: mpsc::UnboundedSender<ClientMessage>,
     net_rx: mpsc::UnboundedReceiver<ServerMessage>,
@@ -142,27 +157,35 @@ impl App {
         is_host: bool,
         code: String,
         auto_start: bool,
+        joined_label: Option<String>,
         host_tx: Option<mpsc::UnboundedSender<HostCommand>>,
         net_tx: mpsc::UnboundedSender<ClientMessage>,
         net_rx: mpsc::UnboundedReceiver<ServerMessage>,
     ) -> Self {
-        // There's only one game kind today, so the client's "confirmation"
-        // is cosmetic - once the host can actually pick among several,
-        // the chosen kind should come from the server instead of this
-        // hardcoded default.
         let screen = if auto_start {
             Screen::Lobby { kind: setup::GameKind::SingleGame }
         } else if is_host {
             Screen::Setup { menu: setup::GameKindMenu::new() }
         } else {
-            Screen::JoinConfirm { kind: setup::GameKind::SingleGame }
+            Screen::JoinConfirm { label: joined_label.unwrap_or_else(|| "a game".to_string()) }
         };
-        let app = Self { should_quit: false, is_host, code, users: Vec::new(), host_tx, net_tx, net_rx, screen };
+        let app = Self {
+            should_quit: false,
+            is_host,
+            code,
+            users: Vec::new(),
+            last_kind: setup::GameKind::SingleGame,
+            host_tx,
+            net_tx,
+            net_rx,
+            screen,
+        };
 
         // Solo mode: nobody to wait for, so skip straight past game
         // selection and the lobby - accept immediately and kick the race
         // off as soon as the server round-trips back.
         if auto_start {
+            let _ = app.net_tx.send(ClientMessage::HostChoseGame { label: setup::GameKind::SingleGame.label().to_string() });
             let _ = app.net_tx.send(ClientMessage::Accept);
             if let Some(tx) = &app.host_tx {
                 let _ = tx.send(HostCommand::Start(setup::GameKind::SingleGame.config()));
@@ -203,7 +226,17 @@ impl App {
                     GameConfig::TypingRace { sentence } => {
                         self.screen = Screen::Race(typing_race::RaceScreen::new(sentence));
                     }
+                    // Never actually sent as a per-round config - Knockout
+                    // is only ever a local `HostCommand::Start` argument;
+                    // the tournament drives its own rounds with
+                    // `TypingRace`. Kept here only so this match stays
+                    // exhaustive as `GameConfig` grows.
+                    GameConfig::Knockout { .. } => {}
                 }
+                let _ = self.net_tx.send(ClientMessage::ReadyForGame);
+            }
+            ServerMessage::Spectating { sentence } => {
+                self.screen = Screen::Race(typing_race::RaceScreen::new_spectating(sentence));
                 let _ = self.net_tx.send(ClientMessage::ReadyForGame);
             }
             ServerMessage::GameBegin => {
@@ -216,7 +249,9 @@ impl App {
                     race.set_racers(racers, all_finished);
                 }
             }
-            ServerMessage::Welcome | ServerMessage::Rejected { .. } => {}
+            ServerMessage::RoundOver(info) => self.screen = Screen::KnockoutRoundOver(info),
+            ServerMessage::TournamentOver { standings } => self.screen = Screen::KnockoutOver { standings },
+            ServerMessage::Welcome { .. } | ServerMessage::Rejected { .. } => {}
         }
     }
 
@@ -230,15 +265,17 @@ impl App {
                 KeyCode::Up => menu.move_up(),
                 KeyCode::Down => menu.move_down(),
                 KeyCode::Enter => {
-                    self.screen = Screen::Lobby { kind: menu.selected() };
+                    let kind = menu.selected();
+                    self.screen = Screen::Lobby { kind };
+                    let _ = self.net_tx.send(ClientMessage::HostChoseGame { label: kind.label().to_string() });
                     let _ = self.net_tx.send(ClientMessage::Accept);
                 }
                 _ => {}
             },
-            Screen::JoinConfirm { kind } => match code {
+            Screen::JoinConfirm { .. } => match code {
                 KeyCode::Char('q') => self.should_quit = true,
                 KeyCode::Enter => {
-                    self.screen = Screen::Lobby { kind: *kind };
+                    self.screen = Screen::Lobby { kind: setup::GameKind::SingleGame }; // unused by non-hosts
                     let _ = self.net_tx.send(ClientMessage::Accept);
                 }
                 _ => {}
@@ -247,6 +284,7 @@ impl App {
                 KeyCode::Char('q') => self.should_quit = true,
                 KeyCode::Enter => {
                     if let Some(tx) = &self.host_tx {
+                        self.last_kind = *kind;
                         let _ = tx.send(HostCommand::Start(kind.config()));
                     }
                 }
@@ -261,12 +299,30 @@ impl App {
                 }
                 KeyCode::Char('r') if self.is_host && race.is_over() => {
                     if let Some(tx) = &self.host_tx {
-                        let _ = tx.send(HostCommand::Start(setup::GameKind::SingleGame.config()));
+                        let _ = tx.send(HostCommand::Start(self.last_kind.config()));
                     }
                 }
                 KeyCode::Char(c) => {
                     if let Some(progress) = race.handle_char(c) {
                         let _ = self.net_tx.send(ClientMessage::Progress(progress));
+                    }
+                }
+                _ => {}
+            },
+            Screen::KnockoutRoundOver(info) => match code {
+                KeyCode::Char('q') => self.should_quit = true,
+                KeyCode::Enter if self.is_host && info.pacing == Pacing::HostPaced => {
+                    if let Some(tx) = &self.host_tx {
+                        let _ = tx.send(HostCommand::ContinueRound);
+                    }
+                }
+                _ => {}
+            },
+            Screen::KnockoutOver { .. } => match code {
+                KeyCode::Char('q') => self.should_quit = true,
+                KeyCode::Char('r') if self.is_host => {
+                    if let Some(tx) = &self.host_tx {
+                        let _ = tx.send(HostCommand::Start(self.last_kind.config()));
                     }
                 }
                 _ => {}
@@ -281,7 +337,7 @@ impl App {
 /// whether the player has to pick a game type and wait in the lobby.
 fn start_hosting(code: String) -> mpsc::UnboundedSender<HostCommand> {
     let clients: waiting::Clients = Arc::new(Mutex::new(HashMap::new()));
-    let hub = game_hub::GameHub::new();
+    let hub = game_hub::ActiveGame::new();
     // The roster (sent as a ServerMessage and rendered in the TUI) already
     // covers joins/leaves, so LobbyEvent is unused for now and just
     // dropped here. Printing it would corrupt the TUI's alternate screen,
@@ -291,9 +347,12 @@ fn start_hosting(code: String) -> mpsc::UnboundedSender<HostCommand> {
     // discovery responder stop taking on new (and now-unhelpable)
     // latecomers - including across a later "play again".
     let (stop_tx, stop_rx) = tokio::sync::watch::channel(false);
+    // Set once the host has picked a game in Setup - before that, the
+    // lobby isn't discoverable or joinable at all.
+    let (chosen_game_tx, chosen_game_rx) = tokio::sync::watch::channel(None);
 
-    tokio::spawn(waiting::listen(code.clone(), clients.clone(), hub.clone(), events_tx, stop_rx.clone()));
-    tokio::spawn(waiting::respond_to_discovery(code, stop_rx));
+    tokio::spawn(waiting::listen(code.clone(), clients.clone(), hub.clone(), events_tx, stop_rx.clone(), chosen_game_tx));
+    tokio::spawn(waiting::respond_to_discovery(code, stop_rx, chosen_game_rx));
 
     let (host_tx, mut host_rx) = mpsc::unbounded_channel::<HostCommand>();
     tokio::spawn(async move {
@@ -301,6 +360,7 @@ fn start_hosting(code: String) -> mpsc::UnboundedSender<HostCommand> {
             match cmd {
                 HostCommand::Start(config) => waiting::start_game(&clients, &hub, config, &stop_tx).await,
                 HostCommand::EndRace => waiting::force_end_race(&clients, &hub).await,
+                HostCommand::ContinueRound => waiting::continue_knockout_round(&clients, &hub).await,
             }
         }
     });
@@ -333,10 +393,10 @@ async fn main() -> Result<()> {
         }
     };
 
-    let (net_tx, net_rx) = join_server(&host_ip, code.clone(), username).await?;
+    let (joined_label, net_tx, net_rx) = join_server(&host_ip, code.clone(), username).await?;
 
     tokio::task::spawn_blocking(move || {
-        ratatui::run(|terminal| run(terminal, is_host, code, auto_start, host_tx, net_tx, net_rx)).context("failed to run app")
+        ratatui::run(|terminal| run(terminal, is_host, code, auto_start, joined_label, host_tx, net_tx, net_rx)).context("failed to run app")
     })
     .await
     .context("tui task panicked")?
@@ -347,11 +407,12 @@ fn run(
     is_host: bool,
     code: String,
     auto_start: bool,
+    joined_label: Option<String>,
     host_tx: Option<mpsc::UnboundedSender<HostCommand>>,
     net_tx: mpsc::UnboundedSender<ClientMessage>,
     net_rx: mpsc::UnboundedReceiver<ServerMessage>,
 ) -> Result<()> {
-    let mut app = App::new(is_host, code, auto_start, host_tx, net_tx, net_rx);
+    let mut app = App::new(is_host, code, auto_start, joined_label, host_tx, net_tx, net_rx);
     while !app.should_quit {
         terminal.draw(|frame| render(frame, &app))?;
         app.update()?;
@@ -362,9 +423,11 @@ fn run(
 fn render(frame: &mut Frame, app: &App) {
     match &app.screen {
         Screen::Setup { menu } => menu.render(frame, frame.area()),
-        Screen::JoinConfirm { kind } => setup::render_join_confirm(frame, frame.area(), *kind),
+        Screen::JoinConfirm { label } => setup::render_join_confirm(frame, frame.area(), label),
         Screen::Lobby { .. } => render_lobby(frame, app),
         Screen::Race(race) => race.render(frame, frame.area(), app.is_host),
+        Screen::KnockoutRoundOver(info) => render_knockout_round_over(frame, app, info),
+        Screen::KnockoutOver { standings } => render_knockout_over(frame, app, standings),
     }
 }
 
@@ -376,5 +439,46 @@ fn render_lobby(frame: &mut Frame, app: &App) {
     frame.render_widget(list, players_area);
 
     let hint = if app.is_host { "press ENTER to start, 'q' to quit" } else { "waiting for host to start... ('q' to quit)" };
+    frame.render_widget(Paragraph::new(hint), hint_area);
+}
+
+fn render_knockout_round_over(frame: &mut Frame, app: &App, info: &RoundOverInfo) {
+    let [status_area, lists_area, hint_area] =
+        Layout::vertical([Constraint::Length(1), Constraint::Min(3), Constraint::Length(1)]).areas(frame.area());
+
+    if let Some(score) = &info.finals_score {
+        let score_text = score.iter().map(|(name, wins)| format!("{name}: {wins}")).collect::<Vec<_>>().join("  vs  ");
+        frame.render_widget(Paragraph::new(format!("Finals! {score_text}")), status_area);
+    } else if info.entering_finals {
+        frame.render_widget(Paragraph::new("Down to the final two - best of 3 begins!"), status_area);
+    } else {
+        frame.render_widget(Paragraph::new("Round over"), status_area);
+    }
+
+    let mut lines: Vec<ListItem> = Vec::new();
+    if !info.eliminated.is_empty() {
+        lines.push(ListItem::new(format!("Eliminated: {}", info.eliminated.join(", "))));
+    }
+    lines.push(ListItem::new(format!("Still in: {}", info.remaining.join(", "))));
+    frame.render_widget(List::new(lines).block(Block::bordered().title("Knockout")), lists_area);
+
+    let hint = match (app.is_host, info.pacing) {
+        (true, Pacing::HostPaced) => "ENTER for next round, 'q' to quit",
+        (false, Pacing::HostPaced) => "waiting for host to continue... ('q' to quit)",
+        (_, Pacing::Auto) => "next round starting automatically... ('q' to quit)",
+    };
+    frame.render_widget(Paragraph::new(hint), hint_area);
+}
+
+fn render_knockout_over(frame: &mut Frame, app: &App, standings: &[String]) {
+    let [title_area, standings_area, hint_area] =
+        Layout::vertical([Constraint::Length(1), Constraint::Min(3), Constraint::Length(1)]).areas(frame.area());
+
+    frame.render_widget(Paragraph::new("Tournament over!"), title_area);
+
+    let items: Vec<ListItem> = standings.iter().enumerate().map(|(i, name)| ListItem::new(format!("{}. {name}", i + 1))).collect();
+    frame.render_widget(List::new(items).block(Block::bordered().title("Final standings")), standings_area);
+
+    let hint = if app.is_host { "R to play again, 'q' to quit" } else { "'q' to quit" };
     frame.render_widget(Paragraph::new(hint), hint_area);
 }

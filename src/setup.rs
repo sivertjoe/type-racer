@@ -3,24 +3,27 @@ use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::style::{Modifier, Style};
 use ratatui::widgets::{Block, List, ListItem, Paragraph};
 
-use crate::protocol::GameConfig;
+use crate::protocol::{GameConfig, Pacing};
 use crate::typing_race;
 
-/// The kind of game a lobby is set up to play. Only one exists today;
-/// adding another just means a new variant here (plus a `config()` arm and
-/// its own screen/logic module) - `waiting.rs` and `game_hub.rs` don't
-/// need to change.
+/// The kind of game a lobby is set up to play - and, for Knockout, how it
+/// paces itself between rounds. Adding a new game means a new variant
+/// here (plus a `config()` arm and its own screen/logic module);
+/// `waiting.rs` and `game_hub.rs` don't need to change.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum GameKind {
     SingleGame,
+    Knockout(Pacing),
 }
 
 impl GameKind {
-    pub const ALL: &'static [GameKind] = &[GameKind::SingleGame];
+    pub const ALL: &'static [GameKind] = &[GameKind::SingleGame, GameKind::Knockout(Pacing::HostPaced), GameKind::Knockout(Pacing::Auto)];
 
     pub fn label(self) -> &'static str {
         match self {
             GameKind::SingleGame => "Single Game (typing race)",
+            GameKind::Knockout(Pacing::HostPaced) => "Knockout (host starts each round)",
+            GameKind::Knockout(Pacing::Auto) => "Knockout (rounds auto-advance)",
         }
     }
 
@@ -30,6 +33,7 @@ impl GameKind {
     pub fn config(self) -> GameConfig {
         match self {
             GameKind::SingleGame => GameConfig::TypingRace { sentence: typing_race::generate_sentence() },
+            GameKind::Knockout(pacing) => GameConfig::Knockout { pacing },
         }
     }
 }
@@ -61,10 +65,14 @@ impl GameKindMenu {
     }
 }
 
-/// The client's read-only view of the game the host picked; they can't
-/// change it, just confirm they're ready to join with it.
-pub fn render_join_confirm(frame: &mut Frame, area: Rect, kind: GameKind) {
-    render_options(frame, area, "Joining", &[kind], 0, "ENTER to join, 'q' to quit");
+/// The client's join screen: shows the game the host already picked
+/// (guaranteed by this point, since joining is gated on the host having
+/// chosen one - see `waiting::respond_to_discovery`).
+pub fn render_join_confirm(frame: &mut Frame, area: Rect, label: &str) {
+    let [list_area, hint_area] = Layout::vertical([Constraint::Min(3), Constraint::Length(1)]).areas(area);
+    let body = Paragraph::new(label).block(Block::bordered().title("Joining"));
+    frame.render_widget(body, list_area);
+    frame.render_widget(Paragraph::new("ENTER to join, 'q' to quit"), hint_area);
 }
 
 fn render_options(frame: &mut Frame, area: Rect, title: &str, kinds: &[GameKind], selected: usize, hint: &str) {

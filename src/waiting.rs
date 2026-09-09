@@ -1,7 +1,5 @@
-use std::collections::{HashMap, HashSet};
-use std::future::Future;
+use std::collections::HashMap;
 use std::net::SocketAddr;
-use std::pin::Pin;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -11,16 +9,8 @@ use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{TcpListener, TcpStream, UdpSocket};
 use tokio::sync::{Mutex, mpsc, watch};
 
-use crate::game_hub::{HubEffect, SharedActiveGame};
-use crate::protocol::{ClientMessage, DiscoveryRequest, DiscoveryResponse, GameConfig, Pacing, ServerMessage};
-
-/// How long the server waits for every client to confirm `ReadyForGame`
-/// before starting the race anyway (in case one is stuck or has dropped).
-const READY_TIMEOUT: Duration = Duration::from_secs(5);
-
-/// How long an auto-paced knockout waits after a round ends before
-/// starting the next one.
-const AUTO_ADVANCE_DELAY: Duration = Duration::from_secs(4);
+use crate::protocol::{ClientMessage, DiscoveryRequest, DiscoveryResponse, ServerMessage};
+use crate::session::{HubEffect, SharedServer, apply_effect, roster_effect};
 
 /// Port the server listens on for game connections.
 pub const PORT: u16 = 7878;
@@ -28,7 +18,11 @@ pub const PORT: u16 = 7878;
 /// Port the server listens on for LAN discovery broadcasts.
 pub const DISCOVERY_PORT: u16 = 7879;
 
-/// A client the server has accepted into the lobby.
+/// A client the server has accepted into the lobby. This - not any
+/// particular gamemode - is the "joining protocol" state: who's
+/// connected, from where, under what name, and whether they've accepted.
+/// It's shared across every phase of the connection's life; only the
+/// `Session` that interprets further messages changes.
 pub struct ClientHandle {
     pub id: u32,
     pub addr: SocketAddr,
@@ -58,17 +52,19 @@ pub fn generate_code() -> String {
 }
 
 /// Binds `PORT` and accepts connections until `stop` is set to `true`
-/// (which [`start_game`] does once the host starts a game - see its
-/// docs for why). Each connection must send a `Join` with the correct
-/// code as its first message; on success it's added to `clients`,
-/// everyone gets an updated `Roster`, and `events` gets a `ClientJoined`.
+/// (set once the host starts a game). Each connection must send a `Join`
+/// with the correct code as its first message; on success it's added to
+/// `clients`, everyone gets an updated `Roster`, and `events` gets a
+/// `ClientJoined`. Purely transport from here on - every message after
+/// `Join` is either handled locally (also transport/admission concerns:
+/// `HostChoseGame`) or handed to `server.dispatch()`, which owns all
+/// actual game/lobby protocol logic.
 pub async fn listen(
     code: String,
     clients: Clients,
-    hub: SharedActiveGame,
+    server: SharedServer,
     events: mpsc::UnboundedSender<LobbyEvent>,
     mut stop: watch::Receiver<bool>,
-    chosen_game: watch::Sender<Option<String>>,
 ) -> Result<()> {
     let listener = TcpListener::bind(("0.0.0.0", PORT))
         .await
@@ -83,7 +79,7 @@ pub async fn listen(
                 let id = next_id;
                 next_id += 1;
 
-                tokio::spawn(handle_connection(id, addr, stream, code.clone(), clients.clone(), hub.clone(), events.clone(), chosen_game.clone()));
+                tokio::spawn(handle_connection(id, addr, stream, code.clone(), clients.clone(), server.clone(), events.clone()));
             }
             result = stop.changed() => {
                 // An error means the sender was dropped (e.g. the app is
@@ -98,95 +94,15 @@ pub async fn listen(
     }
 }
 
-/// Starts a new game (Single Game or a Knockout tournament): stops
-/// accepting new connections and discovery requests (a client joining
-/// mid-race would never get `GameStarting`, yet would still count toward
-/// the "has everyone finished" check forever), then hands `config` to the
-/// hub and applies whatever it produces.
-pub async fn start_game(clients: &Clients, hub: &SharedActiveGame, config: GameConfig, stop_listening: &watch::Sender<bool>) {
-    let _ = stop_listening.send(true);
-
-    let participants = accepted_participants(clients).await;
-    let effect = hub.lock().await.start(config, participants);
-    apply_effect(clients, hub, effect).await;
-    schedule_ready_timeout(clients.clone(), hub.clone());
-}
-
-/// Host-triggered early end to the current round: reports whatever
-/// progress racers had made as final. A no-op if no round is in progress.
-pub async fn force_end_race(clients: &Clients, hub: &SharedActiveGame) {
-    let effect = hub.lock().await.force_end();
-    apply_effect(clients, hub, effect).await;
-}
-
-/// Host-triggered (or auto-paced) advance to the next knockout round. A
-/// no-op unless a knockout tournament is actually between rounds.
-///
-/// Boxed because auto-pacing makes this mutually recursive with
-/// [`apply_effect`] (each round-over can schedule the next round's
-/// auto-advance, which calls back in here) - the compiler can't size an
-/// `async fn` cycle like that without an indirection to break it.
-pub fn continue_knockout_round<'a>(clients: &'a Clients, hub: &'a SharedActiveGame) -> Pin<Box<dyn Future<Output = ()> + Send + 'a>> {
-    Box::pin(async move {
-        let effect = hub.lock().await.continue_knockout_round();
-        apply_effect(clients, hub, effect).await;
-        schedule_ready_timeout(clients.clone(), hub.clone());
-    })
-}
-
-/// The set of client ids currently accepted (past their join-confirmation
-/// screen), with their usernames - what "everyone playing" means for
-/// starting a game or gating a round.
-async fn accepted_participants(clients: &Clients) -> HashMap<u32, String> {
-    clients.lock().await.values().filter(|c| c.accepted).map(|c| (c.id, c.username.clone())).collect()
-}
-
-/// Applies a `HubEffect`: broadcasts or targets messages as needed, and -
-/// if a knockout round just ended in auto-pacing - schedules the next
-/// round to start on its own after [`AUTO_ADVANCE_DELAY`].
-async fn apply_effect(clients: &Clients, hub: &SharedActiveGame, effect: HubEffect) {
-    match effect {
-        HubEffect::None => {}
-        HubEffect::Broadcast(msg) => {
-            let auto_advance = matches!(&msg, ServerMessage::RoundOver(info) if info.pacing == Pacing::Auto);
-            broadcast(&*clients.lock().await, msg);
-            if auto_advance {
-                let clients = clients.clone();
-                let hub = hub.clone();
-                tokio::spawn(async move {
-                    tokio::time::sleep(AUTO_ADVANCE_DELAY).await;
-                    continue_knockout_round(&clients, &hub).await;
-                });
-            }
-        }
-        HubEffect::Targeted(per_client) => {
-            let guard = clients.lock().await;
-            for (id, msg) in per_client {
-                if let Some(client) = guard.get(&id) {
-                    let _ = client.outbox.send(msg);
-                }
-            }
-        }
-    }
-}
-
-fn schedule_ready_timeout(clients: Clients, hub: SharedActiveGame) {
-    tokio::spawn(async move {
-        tokio::time::sleep(READY_TIMEOUT).await;
-        let effect = hub.lock().await.force_begin();
-        apply_effect(&clients, &hub, effect).await;
-    });
-}
-
 /// Listens for UDP discovery broadcasts and replies to any that carry a
-/// matching `code`, until `stop` is set to `true`. Stays silent until
-/// `chosen_game` is `Some` (the host has picked a game in Setup) - clients
-/// shouldn't be able to find, and so join, a lobby the host hasn't
-/// actually opened yet.
-pub async fn respond_to_discovery(code: String, mut stop: watch::Receiver<bool>, chosen_game: watch::Receiver<Option<String>>) -> Result<()> {
+/// matching `code`, until `stop` is set to `true`. Stays silent until the
+/// host has picked a game in Setup - clients shouldn't be able to find,
+/// and so join, a lobby the host hasn't actually opened yet.
+pub async fn respond_to_discovery(code: String, mut stop: watch::Receiver<bool>, server: SharedServer) -> Result<()> {
     let socket = UdpSocket::bind(("0.0.0.0", DISCOVERY_PORT))
         .await
         .context("failed to bind discovery socket")?;
+    let chosen_game = server.chosen_game.subscribe();
 
     let mut buf = [0u8; 256];
     loop {
@@ -242,17 +158,16 @@ pub async fn find_host(code: &str) -> Result<SocketAddr> {
 
 /// Owns one client's socket for its whole lifetime: does the join
 /// handshake, registers it in `clients`, then pumps its outbox to the
-/// socket until it disconnects (or a message arrives, once gameplay
-/// messages exist).
+/// socket and forwards every incoming message to `server` until it
+/// disconnects.
 async fn handle_connection(
     id: u32,
     addr: SocketAddr,
     stream: TcpStream,
     expected_code: String,
     clients: Clients,
-    hub: SharedActiveGame,
+    server: SharedServer,
     events: mpsc::UnboundedSender<LobbyEvent>,
-    chosen_game: watch::Sender<Option<String>>,
 ) {
     let (read_half, mut write_half) = stream.into_split();
     let mut lines = BufReader::new(read_half).lines();
@@ -278,7 +193,7 @@ async fn handle_connection(
     // someone connects with an address they already had cached. The
     // host's own (loopback) connection is exempt - it connects before
     // picking anything.
-    let game_label = chosen_game.borrow().clone();
+    let game_label = server.chosen_game.borrow().clone();
     if !addr.ip().is_loopback() && game_label.is_none() {
         let reject = ServerMessage::Rejected { reason: "the host hasn't chosen a game yet - try again in a moment".into() };
         if let Ok(json) = serde_json::to_string(&reject) {
@@ -296,7 +211,7 @@ async fn handle_connection(
         // hasn't actually changed for anyone.
         username
     };
-    let _ = events.send(LobbyEvent::ClientJoined { id, addr, username: username.clone() });
+    let _ = events.send(LobbyEvent::ClientJoined { id, addr, username });
 
     if let Ok(json) = serde_json::to_string(&ServerMessage::Welcome { game_label }) {
         let _ = write_half.write_all(format!("{json}\n").as_bytes()).await;
@@ -315,32 +230,20 @@ async fn handle_connection(
                 match line {
                     Ok(Some(line)) => {
                         let Ok(msg) = serde_json::from_str::<ClientMessage>(&line) else { continue };
-                        let effect = match msg {
-                            ClientMessage::Join { .. } => continue, // already joined
+                        match msg {
+                            ClientMessage::Join { .. } => {} // already joined
+                            // Connection admission, not lobby/game protocol
+                            // - handled here rather than by a `Session`.
                             ClientMessage::HostChoseGame { label } => {
                                 if addr.ip().is_loopback() {
-                                    let _ = chosen_game.send(Some(label));
+                                    let _ = server.chosen_game.send(Some(label));
                                 }
-                                continue;
                             }
-                            ClientMessage::Accept => {
-                                let mut guard = clients.lock().await;
-                                if let Some(client) = guard.get_mut(&id) {
-                                    client.accepted = true;
-                                }
-                                broadcast_roster(&guard);
-                                continue;
+                            other => {
+                                let effect = server.dispatch(id, other, &clients).await;
+                                apply_effect(&clients, &server, effect).await;
                             }
-                            ClientMessage::ReadyForGame => {
-                                let participants: HashSet<u32> = accepted_participants(&clients).await.into_keys().collect();
-                                hub.lock().await.client_ready(id, &participants)
-                            }
-                            ClientMessage::Progress(progress) => {
-                                let participants: HashSet<u32> = accepted_participants(&clients).await.into_keys().collect();
-                                hub.lock().await.client_progress(id, username.clone(), progress, &participants)
-                            }
-                        };
-                        apply_effect(&clients, &hub, effect).await;
+                        }
                     }
                     _ => break,
                 }
@@ -348,38 +251,21 @@ async fn handle_connection(
         }
     }
 
-    {
-        let mut guard = clients.lock().await;
-        guard.remove(&id);
-        broadcast_roster(&guard);
+    let mut guard = clients.lock().await;
+    guard.remove(&id);
+    if let HubEffect::Broadcast(msg) = roster_effect(&guard) {
+        crate::session::broadcast(&guard, msg);
     }
+    drop(guard);
     let _ = events.send(LobbyEvent::ClientLeft { id, addr });
 }
 
 /// If `username` is already taken by another connected client, appends
 /// " (1)", " (2)", etc. until it's unique.
 fn dedupe_username(clients: &HashMap<u32, ClientHandle>, username: String) -> String {
-    let taken: HashSet<&str> = clients.values().map(|c| c.username.as_str()).collect();
+    let taken: std::collections::HashSet<&str> = clients.values().map(|c| c.username.as_str()).collect();
     if !taken.contains(username.as_str()) {
         return username;
     }
     (1..).map(|n| format!("{username} ({n})")).find(|candidate| !taken.contains(candidate.as_str())).unwrap()
-}
-
-/// Sends every client the current list of *accepted* usernames (clients
-/// still on their join-confirmation screen aren't included yet). Must be
-/// called with the clients lock already held so the roster reflects the
-/// change that triggered it.
-fn broadcast_roster(clients: &HashMap<u32, ClientHandle>) {
-    let mut accepted: Vec<&ClientHandle> = clients.values().filter(|c| c.accepted).collect();
-    accepted.sort_by_key(|c| c.id);
-    let users: Vec<String> = accepted.into_iter().map(|c| c.username.clone()).collect();
-    broadcast(clients, ServerMessage::Roster { users });
-}
-
-/// Sends `msg` to every connected client.
-fn broadcast(clients: &HashMap<u32, ClientHandle>, msg: ServerMessage) {
-    for client in clients.values() {
-        let _ = client.outbox.send(msg.clone());
-    }
 }

@@ -12,10 +12,11 @@ use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::TcpStream;
 use tokio::sync::{Mutex, mpsc};
 
-mod game_hub;
 mod knockout;
 mod protocol;
+mod session;
 mod setup;
+mod single_game;
 mod typing_race;
 mod waiting;
 mod words;
@@ -337,7 +338,6 @@ impl App {
 /// whether the player has to pick a game type and wait in the lobby.
 fn start_hosting(code: String) -> mpsc::UnboundedSender<HostCommand> {
     let clients: waiting::Clients = Arc::new(Mutex::new(HashMap::new()));
-    let hub = game_hub::ActiveGame::new();
     // The roster (sent as a ServerMessage and rendered in the TUI) already
     // covers joins/leaves, so LobbyEvent is unused for now and just
     // dropped here. Printing it would corrupt the TUI's alternate screen,
@@ -349,18 +349,30 @@ fn start_hosting(code: String) -> mpsc::UnboundedSender<HostCommand> {
     let (stop_tx, stop_rx) = tokio::sync::watch::channel(false);
     // Set once the host has picked a game in Setup - before that, the
     // lobby isn't discoverable or joinable at all.
-    let (chosen_game_tx, chosen_game_rx) = tokio::sync::watch::channel(None);
+    let (chosen_game_tx, _) = tokio::sync::watch::channel(None);
+    let server = session::Server::new(chosen_game_tx);
 
-    tokio::spawn(waiting::listen(code.clone(), clients.clone(), hub.clone(), events_tx, stop_rx.clone(), chosen_game_tx));
-    tokio::spawn(waiting::respond_to_discovery(code, stop_rx, chosen_game_rx));
+    tokio::spawn(waiting::listen(code.clone(), clients.clone(), server.clone(), events_tx, stop_rx.clone()));
+    tokio::spawn(waiting::respond_to_discovery(code, stop_rx, server.clone()));
 
     let (host_tx, mut host_rx) = mpsc::unbounded_channel::<HostCommand>();
     tokio::spawn(async move {
         while let Some(cmd) = host_rx.recv().await {
             match cmd {
-                HostCommand::Start(config) => waiting::start_game(&clients, &hub, config, &stop_tx).await,
-                HostCommand::EndRace => waiting::force_end_race(&clients, &hub).await,
-                HostCommand::ContinueRound => waiting::continue_knockout_round(&clients, &hub).await,
+                HostCommand::Start(config) => {
+                    let effect = server.start(config, &clients, &stop_tx).await;
+                    session::apply_effect(&clients, &server, effect).await;
+                    session::schedule_ready_timeout(clients.clone(), server.clone());
+                }
+                HostCommand::EndRace => {
+                    let effect = server.force_end().await;
+                    session::apply_effect(&clients, &server, effect).await;
+                }
+                HostCommand::ContinueRound => {
+                    let effect = server.continue_round().await;
+                    session::apply_effect(&clients, &server, effect).await;
+                    session::schedule_ready_timeout(clients.clone(), server.clone());
+                }
             }
         }
     });

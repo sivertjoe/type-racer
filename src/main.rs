@@ -27,7 +27,9 @@ enum Mode {
     /// No arguments: just play by yourself, skipping straight past game
     /// selection and the lobby wait.
     Solo,
-    Host,
+    /// `code` is `Some` when `--code` picked a specific one; otherwise a
+    /// random one is generated.
+    Host { code: Option<String> },
     Connect { code: String },
 }
 
@@ -35,9 +37,15 @@ fn parse_mode() -> Result<Mode> {
     let args: Vec<String> = std::env::args().skip(1).collect();
     match args.as_slice() {
         [] => Ok(Mode::Solo),
-        [flag] if flag == "--host" => Ok(Mode::Host),
+        [flag] if flag == "--host" => Ok(Mode::Host { code: None }),
+        [flag, opt, code] if flag == "--host" && opt == "--code" => {
+            if code.is_empty() {
+                return Err(eyre!("--code needs a non-empty value"));
+            }
+            Ok(Mode::Host { code: Some(code.to_uppercase()) })
+        }
         [flag, code] if flag == "--connect" => Ok(Mode::Connect { code: code.clone() }),
-        _ => Err(eyre!("usage: type-racer [--host | --connect <code>]")),
+        _ => Err(eyre!("usage: type-racer [--host [--code <code>] | --connect <code>]")),
     }
 }
 
@@ -265,11 +273,14 @@ impl App {
                 KeyCode::Char('q') => self.should_quit = true,
                 KeyCode::Up => menu.move_up(),
                 KeyCode::Down => menu.move_down(),
+                KeyCode::Right => menu.move_right(),
+                KeyCode::Left => menu.move_left(),
                 KeyCode::Enter => {
-                    let kind = menu.selected();
-                    self.screen = Screen::Lobby { kind };
-                    let _ = self.net_tx.send(ClientMessage::HostChoseGame { label: kind.label().to_string() });
-                    let _ = self.net_tx.send(ClientMessage::Accept);
+                    if let Some(kind) = menu.confirm() {
+                        self.screen = Screen::Lobby { kind };
+                        let _ = self.net_tx.send(ClientMessage::HostChoseGame { label: kind.label().to_string() });
+                        let _ = self.net_tx.send(ClientMessage::Accept);
+                    }
                 }
                 _ => {}
             },
@@ -392,8 +403,8 @@ async fn main() -> Result<()> {
             println!("starting a solo game...");
             (true, code, "127.0.0.1".to_string(), Some(host_tx), true)
         }
-        Mode::Host => {
-            let code = waiting::generate_code();
+        Mode::Host { code } => {
+            let code = code.unwrap_or_else(waiting::generate_code);
             let host_tx = start_hosting(code.clone());
             println!("hosting — join code: {code}");
             (true, code, "127.0.0.1".to_string(), Some(host_tx), false)

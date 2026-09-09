@@ -17,6 +17,7 @@ mod protocol;
 mod setup;
 mod typing_race;
 mod waiting;
+mod words;
 
 use protocol::{ClientMessage, GameConfig, ServerMessage};
 

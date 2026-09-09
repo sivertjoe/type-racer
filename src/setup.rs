@@ -24,9 +24,12 @@ impl GameKind {
         }
     }
 
+    /// Builds a fresh `GameConfig` for this kind - called every time a
+    /// game starts (including "play again"), so each race gets new random
+    /// content.
     pub fn config(self) -> GameConfig {
         match self {
-            GameKind::SingleGame => GameConfig::TypingRace { sentence: typing_race::SENTENCE.to_string() },
+            GameKind::SingleGame => GameConfig::TypingRace { sentence: typing_race::generate_sentence() },
         }
     }
 }

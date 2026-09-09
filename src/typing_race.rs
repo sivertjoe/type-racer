@@ -8,8 +8,12 @@ use ratatui::widgets::{Block, Gauge, List, ListItem, Paragraph};
 
 use crate::protocol::{ClientProgress, GameProgress, RacerProgress};
 
-/// Hardcoded for now - every race uses this sentence.
-pub const SENTENCE: &str = "the quick brown fox jumps over the lazy dog while the sun sets slowly behind the mountains";
+const WORDS_PER_RACE: usize = 15;
+
+/// A fresh random sentence for one race - see [`crate::words`].
+pub fn generate_sentence() -> String {
+    crate::words::random_sentence(WORDS_PER_RACE)
+}
 
 const COUNTDOWN: Duration = Duration::from_secs(3);
 

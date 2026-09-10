@@ -174,6 +174,9 @@ enum Screen {
 struct App {
     should_quit: bool,
     is_host: bool,
+    /// Solo mode: no lobby, no other racers - races start with no
+    /// countdown instead of the normal one.
+    solo: bool,
     code: String,
     users: Vec<String>,
     /// The kind last used to start a game - remembered so "play again"
@@ -208,6 +211,7 @@ impl App {
         let app = Self {
             should_quit: false,
             is_host,
+            solo: auto_start,
             code,
             users: Vec::new(),
             last_kind: setup::GameKind::SingleGame,
@@ -260,7 +264,8 @@ impl App {
             ServerMessage::GameStarting { config } => {
                 match config {
                     GameConfig::TypingRace { sentence } => {
-                        self.screen = Screen::Race(typing_race::RaceScreen::new(sentence));
+                        let countdown = if self.solo { typing_race::SOLO_COUNTDOWN } else { typing_race::COUNTDOWN };
+                        self.screen = Screen::Race(typing_race::RaceScreen::new(sentence, countdown));
                     }
                     // Never actually sent as a per-round config - Knockout
                     // is only ever a local `HostCommand::Start` argument;
@@ -272,7 +277,8 @@ impl App {
                 let _ = self.net_tx.send(ClientMessage::ReadyForGame);
             }
             ServerMessage::Spectating { sentence } => {
-                self.screen = Screen::Race(typing_race::RaceScreen::new_spectating(sentence));
+                // Only reachable in a knockout tournament, never solo.
+                self.screen = Screen::Race(typing_race::RaceScreen::new_spectating(sentence, typing_race::COUNTDOWN));
                 let _ = self.net_tx.send(ClientMessage::ReadyForGame);
             }
             ServerMessage::GameBegin => {
@@ -541,4 +547,51 @@ fn render_knockout_over(frame: &mut Frame, app: &App, standings: &[String]) {
 
     let hint = if app.is_host { "R to play again, 'q' to quit" } else { "'q' to quit" };
     frame.render_widget(Paragraph::new(hint), hint_area);
+}
+
+#[cfg(test)]
+mod repro_tests {
+    use super::*;
+    use protocol::{ClientProgress, GameProgress};
+
+    /// Forces the exact interleaving solo mode can hit: `HostCommand::Start`
+    /// (a direct, no-network local channel) replaces `Lobby` with the
+    /// gamemode session before this client's own `Accept` (which has to
+    /// make a real network round trip) is read and processed - nothing
+    /// guarantees the network hop wins that race, and auto-start fires
+    /// both back to back with no delay between them. Drives the real,
+    /// production `handle_connection`/`dispatch` code over a real loopback
+    /// socket, only forcing the ordering explicitly instead of hoping a
+    /// race lands.
+    #[tokio::test]
+    async fn accept_arriving_after_session_start_must_not_be_dropped() {
+        let code = waiting::generate_code();
+        let host_tx = start_hosting(code.clone());
+        let (_label, net_tx, mut net_rx) = join_server("127.0.0.1", code, "tester".to_string()).await.unwrap();
+
+        // Force the losing order: the gamemode session replaces the lobby
+        // first...
+        host_tx.send(HostCommand::Start(GameConfig::TypingRace { sentence: "hi there".into() })).unwrap();
+        assert!(matches!(recv(&mut net_rx).await, ServerMessage::GameStarting { .. }));
+
+        // ...and only then does this client's Accept get sent and make its
+        // real round trip to the server.
+        net_tx.send(ClientMessage::Accept).unwrap();
+        assert!(matches!(recv(&mut net_rx).await, ServerMessage::Roster { .. }), "Accept should still update the roster");
+
+        // With `accepted` never set, `participants` would be empty and the
+        // very first progress report vacuously satisfies "all participants
+        // finished".
+        net_tx.send(ClientMessage::ReadyForGame).unwrap();
+        assert!(matches!(recv(&mut net_rx).await, ServerMessage::GameBegin));
+
+        let progress = ClientProgress { finished: false, detail: GameProgress::TypingRace { correct_chars: 1, elapsed_ms: 10 } };
+        net_tx.send(ClientMessage::Progress(progress)).unwrap();
+        let ServerMessage::RaceState { all_finished, .. } = recv(&mut net_rx).await else { panic!("expected a RaceState broadcast") };
+        assert!(!all_finished, "race reported over after a single, unfinished keystroke");
+    }
+
+    async fn recv(rx: &mut mpsc::UnboundedReceiver<ServerMessage>) -> ServerMessage {
+        tokio::time::timeout(Duration::from_secs(2), rx.recv()).await.expect("timed out waiting for a server message").unwrap()
+    }
 }

@@ -15,7 +15,12 @@ pub fn generate_sentence() -> String {
     crate::words::random_sentence(WORDS_PER_RACE)
 }
 
-const COUNTDOWN: Duration = Duration::from_secs(3);
+/// Countdown before a normal (multiplayer) race's `GameBegin` unlocks input.
+pub const COUNTDOWN: Duration = Duration::from_secs(3);
+
+/// Countdown for a solo race - nobody else to wait in sync with, so skip
+/// straight to typing.
+pub const SOLO_COUNTDOWN: Duration = Duration::from_secs(0);
 
 /// Client-side state for a typing race: the local player's own progress
 /// through the sentence, plus the last roster of everyone's progress
@@ -23,6 +28,8 @@ const COUNTDOWN: Duration = Duration::from_secs(3);
 pub struct RaceScreen {
     sentence: Vec<char>,
     typed: usize,
+    /// How long the countdown lasts once `GameBegin` arrives.
+    countdown: Duration,
     /// `None` until `GameBegin` arrives; once set, this is also the moment
     /// input unlocks and the moment WPM is measured from.
     countdown_ends_at: Option<Instant>,
@@ -36,18 +43,19 @@ pub struct RaceScreen {
 }
 
 impl RaceScreen {
-    pub fn new(sentence: String) -> Self {
-        Self::build(sentence, false)
+    pub fn new(sentence: String, countdown: Duration) -> Self {
+        Self::build(sentence, countdown, false)
     }
 
-    pub fn new_spectating(sentence: String) -> Self {
-        Self::build(sentence, true)
+    pub fn new_spectating(sentence: String, countdown: Duration) -> Self {
+        Self::build(sentence, countdown, true)
     }
 
-    fn build(sentence: String, spectating: bool) -> Self {
+    fn build(sentence: String, countdown: Duration, spectating: bool) -> Self {
         Self {
             sentence: sentence.chars().collect(),
             typed: 0,
+            countdown,
             countdown_ends_at: None,
             finished_sent: false,
             racers: Vec::new(),
@@ -59,7 +67,7 @@ impl RaceScreen {
     /// Called when the server broadcasts `GameBegin`: starts the local
     /// countdown, after which keystrokes are accepted.
     pub fn on_game_begin(&mut self) {
-        self.countdown_ends_at = Some(Instant::now() + COUNTDOWN);
+        self.countdown_ends_at = Some(Instant::now() + self.countdown);
     }
 
     pub fn set_racers(&mut self, racers: Vec<RacerProgress>, all_finished: bool) {

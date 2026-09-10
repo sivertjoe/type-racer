@@ -239,6 +239,26 @@ async fn handle_connection(
                                     let _ = server.chosen_game.send(Some(label));
                                 }
                             }
+                            // Also connection admission: whether a client
+                            // counts towards the participant set must not
+                            // depend on which `Session` happens to be
+                            // active when this arrives. Solo mode fires
+                            // `Accept` and `HostCommand::Start` back to
+                            // back with no delay between them, so the
+                            // lobby can already have been replaced by a
+                            // gamemode session (which doesn't understand
+                            // `Accept`) by the time this is dispatched -
+                            // silently dropping it here left the host
+                            // permanently excluded from `participants`.
+                            ClientMessage::Accept => {
+                                let mut guard = clients.lock().await;
+                                if let Some(client) = guard.get_mut(&id) {
+                                    client.accepted = true;
+                                }
+                                if let HubEffect::Broadcast(msg) = roster_effect(&guard) {
+                                    crate::session::broadcast(&guard, msg);
+                                }
+                            }
                             other => {
                                 let effect = server.dispatch(id, other, &clients).await;
                                 apply_effect(&clients, &server, effect).await;

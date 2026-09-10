@@ -68,16 +68,10 @@ pub trait Session: Send {
 pub struct Lobby;
 
 impl Session for Lobby {
-    fn handle_message(&mut self, id: u32, msg: ClientMessage, clients: &mut HashMap<u32, ClientHandle>) -> HubEffect {
-        match msg {
-            ClientMessage::Accept => {
-                if let Some(client) = clients.get_mut(&id) {
-                    client.accepted = true;
-                }
-                roster_effect(clients)
-            }
-            _ => HubEffect::None,
-        }
+    /// `Accept` is handled directly by `waiting.rs` (connection admission,
+    /// not lobby protocol) rather than here - see its comment there.
+    fn handle_message(&mut self, _id: u32, _msg: ClientMessage, _clients: &mut HashMap<u32, ClientHandle>) -> HubEffect {
+        HubEffect::None
     }
 
     fn accepts_start(&self) -> bool {

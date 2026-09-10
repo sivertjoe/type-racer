@@ -1,6 +1,6 @@
 [package]
 name = "type-racer"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2024"
 authors = ["Sivert Johansen <sivert.johansen@visma.com>"]
 description = "A terminal-based multiplayer typing race game"

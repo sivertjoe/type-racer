@@ -6,14 +6,7 @@ use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Gauge, List, ListItem, Paragraph};
 
-use crate::protocol::{ClientProgress, GameProgress, RacerProgress};
-
-const WORDS_PER_RACE: usize = 15;
-
-/// A fresh random sentence for one race - see [`crate::words`].
-pub fn generate_sentence() -> String {
-    crate::words::random_sentence(WORDS_PER_RACE)
-}
+use type_racer_core::protocol::{ClientProgress, GameProgress, RacerProgress};
 
 /// Countdown before a normal (multiplayer) race's `GameBegin` unlocks input.
 pub const COUNTDOWN: Duration = Duration::from_secs(3);

@@ -1786,13 +1786,23 @@ dependencies = [
 
 [[package]]
 name = "type-racer"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "clap",
  "color-eyre",
  "crossterm",
- "rand 0.10.2",
  "ratatui",
+ "serde_json",
+ "tokio",
+ "type-racer-core",
+]
+
+[[package]]
+name = "type-racer-core"
+version = "0.2.1"
+dependencies = [
+ "color-eyre",
+ "rand 0.10.2",
  "serde",
  "serde_json",
  "tokio",

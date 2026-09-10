@@ -64,7 +64,7 @@ impl KnockoutServer {
     /// else. Must be called once right after construction, and again
     /// each time [`Session::continue_round`] fires.
     pub fn begin_round(&mut self) -> HubEffect {
-        let sentence = crate::typing_race::generate_sentence();
+        let sentence = crate::words::generate_sentence();
         self.round = RoundState::Starting { ready: HashSet::new() };
 
         let mut per_client = HashMap::with_capacity(self.usernames.len());

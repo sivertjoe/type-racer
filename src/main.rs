@@ -13,16 +13,11 @@ use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::TcpStream;
 use tokio::sync::{Mutex, mpsc};
 
-mod knockout;
-mod protocol;
-mod session;
 mod setup;
-mod single_game;
 mod typing_race;
-mod waiting;
-mod words;
 
-use protocol::{ClientMessage, GameConfig, Pacing, RoundOverInfo, ServerMessage};
+use type_racer_core::protocol::{ClientMessage, GameConfig, Pacing, RoundOverInfo, ServerMessage};
+use type_racer_core::{session, waiting};
 
 #[derive(Parser)]
 #[command(name = "type-racer", about = "A terminal-based multiplayer typing race game", version)]
@@ -552,7 +547,7 @@ fn render_knockout_over(frame: &mut Frame, app: &App, standings: &[String]) {
 #[cfg(test)]
 mod repro_tests {
     use super::*;
-    use protocol::{ClientProgress, GameProgress};
+    use type_racer_core::protocol::{ClientProgress, GameProgress};
 
     /// Forces the exact interleaving solo mode can hit: `HostCommand::Start`
     /// (a direct, no-network local channel) replaces `Lobby` with the

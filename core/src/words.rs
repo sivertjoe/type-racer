@@ -51,3 +51,10 @@ pub fn random_sentence(count: usize) -> String {
     let mut rng = rand::rng();
     (0..count).map(|_| WORDS[rng.random_range(0..WORDS.len())]).collect::<Vec<_>>().join(" ")
 }
+
+const WORDS_PER_RACE: usize = 15;
+
+/// A fresh random sentence for one race.
+pub fn generate_sentence() -> String {
+    random_sentence(WORDS_PER_RACE)
+}

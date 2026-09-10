@@ -1,6 +1,9 @@
+[workspace]
+members = ["core"]
+
 [package]
 name = "type-racer"
-version = "0.2.0"
+version = "0.2.1"
 edition = "2024"
 authors = ["Sivert Johansen <sivert.johansen@visma.com>"]
 description = "A terminal-based multiplayer typing race game"
@@ -9,12 +12,11 @@ description = "A terminal-based multiplayer typing race game"
 eula = false
 
 [dependencies]
+type-racer-core = { path = "core" }
 clap = { version = "4", features = ["derive"] }
 tokio = { version = "1", features = ["io-util", "macros", "net", "rt-multi-thread", "sync", "time"] }
 crossterm = "0.29"
 color-eyre = "0.6.5"
 ratatui = "0.30.2"
-serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.151"
-rand = "0.10.2"
 

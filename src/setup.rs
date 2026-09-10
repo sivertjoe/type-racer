@@ -3,8 +3,8 @@ use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::style::{Modifier, Style};
 use ratatui::widgets::{Block, List, ListItem, Paragraph};
 
-use crate::protocol::{GameConfig, Pacing};
-use crate::typing_race;
+use type_racer_core::protocol::{GameConfig, Pacing};
+use type_racer_core::words;
 
 /// The kind of game a lobby is set up to play - and, for Knockout, how it
 /// paces itself between rounds. Adding a new game means a new variant
@@ -31,7 +31,7 @@ impl GameKind {
     /// content.
     pub fn config(self) -> GameConfig {
         match self {
-            GameKind::SingleGame => GameConfig::TypingRace { sentence: typing_race::generate_sentence() },
+            GameKind::SingleGame => GameConfig::TypingRace { sentence: words::generate_sentence() },
             GameKind::Knockout(pacing) => GameConfig::Knockout { pacing },
         }
     }

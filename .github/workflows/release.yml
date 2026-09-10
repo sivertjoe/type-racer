@@ -1,0 +1,34 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+# Needed for softprops/action-gh-release to create the release and upload
+# the .msi as an asset.
+permissions:
+  contents: write
+
+jobs:
+  build-msi:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: Install cargo-wix
+        run: cargo install cargo-wix --locked
+
+      - name: Build the MSI installer
+        # `--package` is required in a workspace - otherwise cargo-wix can't
+        # tell which member (core has no binary/installer of its own) to
+        # build the installer for.
+        run: cargo wix --package type-racer
+
+      - name: Publish release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: target/wix/*.msi
+          generate_release_notes: true
